@@ -65,6 +65,24 @@ const getGithubAppPrivateKey = () => {
     };
   }
 
+  if (parsedKey.includes("...")) {
+    return {
+      key: null,
+      error:
+        "GITHUB_APP_PRIVATE_KEY appears to be a placeholder (contains '...'). Paste the full PEM private key content from your downloaded .pem file.",
+    };
+  }
+
+  try {
+    crypto.createPrivateKey(parsedKey);
+  } catch {
+    return {
+      key: null,
+      error:
+        "GITHUB_APP_PRIVATE_KEY is not a valid PEM private key. Download a new private key in GitHub App settings and paste the entire file content.",
+    };
+  }
+
   return { key: parsedKey, error: null };
 };
 
