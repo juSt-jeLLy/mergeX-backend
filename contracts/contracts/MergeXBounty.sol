@@ -12,9 +12,9 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  * Full lifecycle:
  *   1. Org registers a GitHub repo + funds a reward pool
  *   2. Org creates bounties (one per GitHub issue) — or batch-imports open issues
- *   3. Contributor calls takeBounty() + stakes 10-20% collateral → ASSIGNED
+ *   3. Contributor calls takeBounty() + stakes 10-20% collateral → ASSIGNED //TO DO: add a modifier which checks if a issue is currently free or not , if not free then only can be assigned
  *   4. Contributor opens a PR, calls submitPR() to record the PR URL on-chain → PR_SUBMITTED
- *   5a. Org merges the PR on GitHub → calls approveMerge() → MERGED
+ *   5a. Org merges the PR on GitHub → calls approveMerge() → MERGED //optional: can return the stake to the contributor in the same function only along with bounty reward(won't need claimBounty then ig )
  *       Contributor calls claimBounty() → receives bounty + full stake → COMPLETED
  *   5b. Org rejects the PR → calls rejectPR() → bounty reopens, contributor gets full stake back
  *
@@ -24,7 +24,8 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  *       bounty reopens
  *   - Deadline passed, status PR_SUBMITTED (org never responded):
  *       contributor gets full stake back (org's fault for not reviewing)
- *       bounty reopens
+ *       bounty reopens 
+ 
  */
 contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
@@ -133,8 +134,8 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     uint256 public constant MAX_CONTRIBUTOR_STAKE_BPS = 2000;  // 20%
     // Slash 50% of stake if contributor abandons (never submits PR before deadline)
     uint256 public constant ABANDON_SLASH_BPS         = 5000;  // 50%
-
-    uint256 public constant DEFAULT_LOW_DURATION      = 14 days;
+    uint256 public constant DEFAULT_TEST_DURATION= 3 minutes;
+    uint256 public constant DEFAULT_LOW_DURATION      = 3 minutes;
     uint256 public constant DEFAULT_MEDIUM_DURATION   = 30 days;
     uint256 public constant DEFAULT_HIGH_DURATION     = 60 days;
     uint256 public constant DEFAULT_CRITICAL_DURATION = 150 days;
@@ -155,6 +156,10 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
     modifier bountyExists(uint256 _bountyId) {
         require(bounties[_bountyId].id != 0, "Bounty does not exist");
+        _;
+    }
+    modifier isBountyAvailable(uint256 _bountyId){
+        require(bounties[_bountyId].assignedTo== address(0),"Bounty is already assigned ");
         _;
     }
 
@@ -196,6 +201,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
             totalFunded: msg.value,
             available: msg.value,
             isActive: true,
+
             easyDuration:   _easyDuration   > 0 ? _easyDuration   : DEFAULT_LOW_DURATION,
             mediumDuration: _mediumDuration  > 0 ? _mediumDuration  : DEFAULT_MEDIUM_DURATION,
             hardDuration:   _hardDuration    > 0 ? _hardDuration    : DEFAULT_CRITICAL_DURATION
@@ -453,6 +459,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         require(b.assignedTo == msg.sender, "Only assigned contributor");
         require(b.status == BountyStatus.ASSIGNED, "Bounty not in ASSIGNED state");
         require(bytes(_prUrl).length > 0, "Empty PR URL");
+        require(block.timestamp <= b.deadline, "Deadline has passed");
 
         b.status       = BountyStatus.PR_SUBMITTED;
         b.prUrl        = _prUrl;
@@ -603,13 +610,13 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     /**
      * @notice Safety valve: withdraw stake that is no longer locked in any bounty.
      */
-    function withdrawStake() external nonReentrant {
-        uint256 amount = contributorStakes[msg.sender];
-        require(amount > 0, "Nothing to withdraw");
-        contributorStakes[msg.sender] = 0;
-        payable(msg.sender).transfer(amount);
-        emit StakeWithdrawn(msg.sender, amount);
-    }
+    // function withdrawStake() external nonReentrant {
+    //     uint256 amount = contributorStakes[msg.sender];
+    //     require(amount > 0, "Nothing to withdraw");
+    //     contributorStakes[msg.sender] = 0;
+    //     payable(msg.sender).transfer(amount);
+    //     emit StakeWithdrawn(msg.sender, amount);
+    // }
 
     // ─────────────────────────────────────────────────────────────────────────
     // View Helpers
