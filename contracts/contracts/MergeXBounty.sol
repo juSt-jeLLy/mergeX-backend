@@ -8,8 +8,19 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 /**
  * @title MergeXBounty
  * @notice Decentralized bounty platform for open-source security issues.
- *         Organizations register repos and fund bounties.
- *         Contributors pick up issues, stake collateral, and earn rewards.
+ *
+ * Full lifecycle:
+ *   1. Org registers a GitHub repo + funds a reward pool
+ *   2. Org creates bounties (one per GitHub issue) — or batch-imports open issues
+ *   3. Contributor calls takeBounty() + stakes 10-20% collateral → ASSIGNED
+ *   4. Contributor opens a PR, calls submitPR() to record the PR URL on-chain → PR_SUBMITTED
+ *   5. Org merges the PR on GitHub, calls approveMerge() on-chain → MERGED
+ *   6. Contributor calls claimBounty() → receives bounty reward + stake back → COMPLETED
+ *
+ * Expiry:
+ *   - If deadline passes while ASSIGNED (no PR yet) → contributor claims stake back, bounty reopens
+ *   - If deadline passes while PR_SUBMITTED → contributor can still claim stake back, bounty reopens
+ *     (org had time to review; if they didn't merge it's on them — contributor gets stake)
  */
 contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
@@ -17,13 +28,10 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     // Events
     // ─────────────────────────────────────────────────────────────────────────
 
-    event RepoRegistered(
-        address indexed org,
-        uint256 indexed repoId,
-        string repoUrl,
-        uint256 stakedAmount
-    );
+    event RepoRegistered(address indexed org, uint256 indexed repoId, string repoUrl, uint256 stakedAmount);
     event RepoFunded(address indexed org, uint256 indexed repoId, uint256 addedAmount, uint256 newTotal);
+    event FundsWithdrawn(address indexed org, uint256 indexed repoId, uint256 amount);
+
     event BountyCreated(
         uint256 indexed bountyId,
         uint256 indexed repoId,
@@ -34,85 +42,89 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     );
     event BountyIncreased(uint256 indexed bountyId, uint256 addedAmount, uint256 newTotal);
     event BountyCancelled(uint256 indexed bountyId);
+
     event BountyTaken(uint256 indexed bountyId, address indexed contributor, uint256 deadline, uint256 stake);
-    event BountyCompleted(uint256 indexed bountyId, address indexed contributor, uint256 reward);
-    event BountyExpired(uint256 indexed bountyId, address indexed contributor);
+    event PRSubmitted(uint256 indexed bountyId, address indexed contributor, string prUrl);
+    event MergeApproved(uint256 indexed bountyId, address indexed org, string prUrl);
+    event BountyClaimed(uint256 indexed bountyId, address indexed contributor, uint256 reward);
+    event BountyExpired(uint256 indexed bountyId, address indexed contributor, BountyStatus statusAtExpiry);
+
     event StakeWithdrawn(address indexed contributor, uint256 amount);
-    event FundsWithdrawn(address indexed org, uint256 indexed repoId, uint256 amount);
 
     // ─────────────────────────────────────────────────────────────────────────
     // Types
     // ─────────────────────────────────────────────────────────────────────────
 
     enum Severity { LOW, MEDIUM, HIGH, CRITICAL }
-    enum BountyStatus { OPEN, ASSIGNED, COMPLETED, CANCELLED }
+
+    /**
+     * OPEN          — bounty is live, anyone can take it
+     * ASSIGNED      — contributor staked and is working on it
+     * PR_SUBMITTED  — contributor submitted a PR URL on-chain, waiting for org to merge
+     * MERGED        — org confirmed the PR was merged; contributor can now claim
+     * COMPLETED     — bounty paid out
+     * CANCELLED     — org cancelled before anyone took it
+     */
+    enum BountyStatus { OPEN, ASSIGNED, PR_SUBMITTED, MERGED, COMPLETED, CANCELLED }
 
     struct Repo {
         uint256 id;
         string repoUrl;         // e.g. "owner/repo"
         address owner;
         uint256 totalFunded;    // lifetime ETH deposited
-        uint256 available;      // ETH currently available to fund new bounties
+        uint256 available;      // ETH available to fund new bounties
         bool isActive;
         uint256 easyDuration;   // deadline window for LOW bounties
-        uint256 mediumDuration;
-        uint256 hardDuration;   // deadline window for CRITICAL bounties
+        uint256 mediumDuration; // deadline window for MEDIUM bounties
+        uint256 hardDuration;   // deadline window for HIGH + CRITICAL bounties
     }
 
     struct Bounty {
         uint256 id;
         uint256 repoId;
         address org;
-        string githubIssueUrl;  // canonical GitHub issue URL
-        string githubIssueId;   // numeric GitHub issue id (string for flexibility)
+        string githubIssueUrl;   // e.g. https://github.com/owner/repo/issues/42
+        string githubIssueId;    // e.g. "42"
         string title;
         string description;
-        uint256 amount;         // locked reward
+        uint256 amount;          // locked reward in wei
         Severity severity;
         BountyStatus status;
         address assignedTo;
         uint256 createdAt;
-        uint256 deadline;       // 0 until taken
-        uint256 contributorStake; // contributor's skin-in-the-game deposit
+        uint256 deadline;        // 0 until taken
+        uint256 contributorStake;
+        string prUrl;            // set by contributor via submitPR()
+        uint256 prSubmittedAt;   // block.timestamp when PR was submitted
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // State
     // ─────────────────────────────────────────────────────────────────────────
 
-    uint256 public nextRepoId  = 1;
+    uint256 public nextRepoId   = 1;
     uint256 public nextBountyId = 1;
 
-    // repoId → Repo
-    mapping(uint256 => Repo) public repos;
-    // org address → list of repoIds they own
+    mapping(uint256 => Repo)    public repos;
     mapping(address => uint256[]) public orgRepos;
-    // repoUrl (lowercase) → repoId  (prevents duplicate registrations)
-    mapping(bytes32 => uint256) public repoUrlToId;
+    mapping(bytes32 => uint256) public repoUrlToId;   // lowercase hash → repoId
 
-    // bountyId → Bounty
-    mapping(uint256 => Bounty) public bounties;
-    // repoId → list of bountyIds
-    mapping(uint256 => uint256[]) public repoBounties;
-    // githubIssueUrl hash → bountyId  (prevents duplicate bounties per issue)
-    mapping(bytes32 => uint256) public issueUrlToBountyId;
+    mapping(uint256 => Bounty)  public bounties;
+    mapping(uint256 => uint256[]) public repoBounties; // repoId → bountyIds
+    mapping(bytes32 => uint256) public issueUrlToBountyId; // issue URL hash → bountyId
 
-    // contributor address → total staked (across all active bounties)
     mapping(address => uint256) public contributorStakes;
-    // contributor → list of bountyIds they're assigned to
     mapping(address => uint256[]) public contributorBounties;
-    // bountyId → all addresses that ever attempted it
     mapping(uint256 => address[]) public bountyApplicants;
-    // bountyId → address → attempted?
     mapping(uint256 => mapping(address => bool)) public hasAttempted;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Constants
     // ─────────────────────────────────────────────────────────────────────────
 
-    uint256 public constant MIN_ORG_STAKE = 0.000001 ether;
-    uint256 public constant CONTRIBUTOR_STAKE_BPS = 1000; // 10 % of bounty (basis points)
-    uint256 public constant MAX_CONTRIBUTOR_STAKE_BPS = 2000; // 20 %
+    uint256 public constant MIN_ORG_STAKE             = 0.000001 ether;
+    uint256 public constant CONTRIBUTOR_STAKE_BPS     = 1000;  // 10%
+    uint256 public constant MAX_CONTRIBUTOR_STAKE_BPS = 2000;  // 20%
 
     uint256 public constant DEFAULT_LOW_DURATION      = 14 days;
     uint256 public constant DEFAULT_MEDIUM_DURATION   = 30 days;
@@ -145,15 +157,16 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     constructor() Ownable(msg.sender) {}
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Organization / Repo Management
+    // Repo Management
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Register a GitHub repo and fund it. Org can register multiple repos.
-     * @param _repoUrl  e.g. "owner/repo"
-     * @param _easyDuration     deadline override for LOW bounties (0 = use default)
-     * @param _mediumDuration   deadline override for MEDIUM
-     * @param _hardDuration     deadline override for HIGH/CRITICAL
+     * @notice Register a GitHub repo and seed its reward pool.
+     *         An org can register multiple repos; each gets its own pool.
+     * @param _repoUrl        "owner/repo" — case-insensitive, duplicates rejected
+     * @param _easyDuration   deadline for LOW bounties   (0 = use default 14d)
+     * @param _mediumDuration deadline for MEDIUM bounties (0 = use default 30d)
+     * @param _hardDuration   deadline for HIGH+CRITICAL  (0 = use default 150d)
      */
     function registerRepo(
         string calldata _repoUrl,
@@ -168,7 +181,6 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         require(repoUrlToId[urlHash] == 0, "Repo already registered");
 
         repoId = nextRepoId++;
-
         repos[repoId] = Repo({
             id: repoId,
             repoUrl: _repoUrl,
@@ -187,12 +199,9 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         emit RepoRegistered(msg.sender, repoId, _repoUrl, msg.value);
     }
 
-    /**
-     * @notice Add more ETH to an existing repo's reward pool.
-     */
+    /// @notice Top up an existing repo's reward pool.
     function fundRepo(uint256 _repoId)
-        external
-        payable
+        external payable
         repoExists(_repoId)
         onlyRepoOwner(_repoId)
         whenNotPaused
@@ -203,9 +212,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         emit RepoFunded(msg.sender, _repoId, msg.value, repos[_repoId].available);
     }
 
-    /**
-     * @notice Withdraw idle funds from a repo (only what isn't locked in open bounties).
-     */
+    /// @notice Withdraw idle funds (only what isn't locked in active bounties).
     function withdrawRepoFunds(uint256 _repoId, uint256 _amount)
         external
         nonReentrant
@@ -219,9 +226,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         emit FundsWithdrawn(msg.sender, _repoId, _amount);
     }
 
-    /**
-     * @notice Update deadline windows for a repo.
-     */
+    /// @notice Update deadline windows for a repo.
     function updateDeadlines(
         uint256 _repoId,
         uint256 _easyDuration,
@@ -236,20 +241,13 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Bounty Lifecycle
+    // Bounty Creation
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Create a bounty linked to a GitHub issue.
-     *         Can be called by the repo owner OR any address that provides extra ETH
-     *         to top-up the repo first (owner-only for simplicity here).
-     * @param _repoId         Registered repo id
-     * @param _githubIssueUrl Full GitHub issue URL (e.g. https://github.com/owner/repo/issues/42)
-     * @param _githubIssueId  GitHub issue number as string (e.g. "42")
-     * @param _title          Issue title
-     * @param _description    Short description / audit scope
-     * @param _amount         Reward in wei (deducted from repo.available)
-     * @param _severity       LOW / MEDIUM / HIGH / CRITICAL
+     * @notice Create a bounty for a single GitHub issue.
+     * @param _githubIssueUrl Full URL e.g. https://github.com/owner/repo/issues/42
+     * @param _githubIssueId  Issue number as string e.g. "42"
      */
     function createBounty(
         uint256 _repoId,
@@ -268,7 +266,6 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         require(issueUrlToBountyId[issueHash] == 0, "Bounty already exists for this issue");
 
         bountyId = nextBountyId++;
-
         bounties[bountyId] = Bounty({
             id: bountyId,
             repoId: _repoId,
@@ -283,7 +280,9 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
             assignedTo: address(0),
             createdAt: block.timestamp,
             deadline: 0,
-            contributorStake: 0
+            contributorStake: 0,
+            prUrl: "",
+            prSubmittedAt: 0
         });
 
         repos[_repoId].available -= _amount;
@@ -294,8 +293,8 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
-     * @notice Batch-create bounties from a list of already-open GitHub issues.
-     *         Useful for importing existing repo issues as bounties in one tx.
+     * @notice Batch-create bounties from already-open GitHub issues in one transaction.
+     *         Silently skips any issue URL that already has a bounty.
      */
     function batchCreateBounties(
         uint256 _repoId,
@@ -323,7 +322,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         bountyIds = new uint256[](len);
         for (uint256 i = 0; i < len; i++) {
             bytes32 issueHash = keccak256(bytes(_githubIssueUrls[i]));
-            if (issueUrlToBountyId[issueHash] != 0) continue; // skip duplicates silently
+            if (issueUrlToBountyId[issueHash] != 0) continue;
 
             uint256 bid = nextBountyId++;
             bounties[bid] = Bounty({
@@ -340,7 +339,9 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
                 assignedTo: address(0),
                 createdAt: block.timestamp,
                 deadline: 0,
-                contributorStake: 0
+                contributorStake: 0,
+                prUrl: "",
+                prSubmittedAt: 0
             });
 
             repos[_repoId].available -= _amounts[i];
@@ -352,30 +353,25 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         }
     }
 
-    /**
-     * @notice Increase the reward of an open or assigned bounty.
-     *         Sends extra ETH — added directly to the bounty (not the repo pool).
-     */
+    /// @notice Increase the reward on any non-closed bounty. ETH sent goes directly to the bounty.
     function increaseBounty(uint256 _bountyId)
-        external
-        payable
+        external payable
         bountyExists(_bountyId)
         onlyRepoOwner(bounties[_bountyId].repoId)
         whenNotPaused
     {
         Bounty storage b = bounties[_bountyId];
-        require(b.status != BountyStatus.COMPLETED && b.status != BountyStatus.CANCELLED, "Bounty closed");
+        require(
+            b.status != BountyStatus.COMPLETED && b.status != BountyStatus.CANCELLED,
+            "Bounty closed"
+        );
         require(msg.value > 0, "Send ETH");
-
         repos[b.repoId].totalFunded += msg.value;
         b.amount += msg.value;
-
         emit BountyIncreased(_bountyId, msg.value, b.amount);
     }
 
-    /**
-     * @notice Cancel an OPEN (unassigned) bounty and return funds to repo pool.
-     */
+    /// @notice Cancel an OPEN (unassigned) bounty and return funds to repo pool.
     function cancelBounty(uint256 _bountyId)
         external
         bountyExists(_bountyId)
@@ -387,7 +383,6 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         b.status = BountyStatus.CANCELLED;
         repos[b.repoId].available += b.amount;
 
-        // clear the url reservation so a new bounty can be created for same issue
         bytes32 issueHash = keccak256(bytes(b.githubIssueUrl));
         delete issueUrlToBountyId[issueHash];
 
@@ -399,27 +394,33 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * @notice Take an open bounty. Contributor must stake 10–20 % of the bounty amount.
+     * @notice Step 1 — Take an open bounty. Stake 10–20% of the bounty as collateral.
+     *                  Deadline countdown begins from this call.
      */
-    function takeBounty(uint256 _bountyId) external payable nonReentrant whenNotPaused bountyExists(_bountyId) {
+    function takeBounty(uint256 _bountyId)
+        external payable
+        nonReentrant
+        whenNotPaused
+        bountyExists(_bountyId)
+    {
         Bounty storage b = bounties[_bountyId];
         require(b.status == BountyStatus.OPEN, "Bounty not open");
         require(msg.sender != b.org, "Org cannot take own bounty");
-        require(!hasAttempted[_bountyId][msg.sender], "Already attempted");
+        require(!hasAttempted[_bountyId][msg.sender], "Already attempted this bounty");
 
         uint256 minStake = (b.amount * CONTRIBUTOR_STAKE_BPS) / 10000;
         uint256 maxStake = (b.amount * MAX_CONTRIBUTOR_STAKE_BPS) / 10000;
-        require(msg.value >= minStake && msg.value <= maxStake, "Stake out of range");
+        require(msg.value >= minStake && msg.value <= maxStake, "Stake out of range (10-20% of bounty)");
 
         Repo storage r = repos[b.repoId];
         uint256 deadline;
-        if (b.severity == Severity.LOW)      deadline = block.timestamp + r.easyDuration;
+        if      (b.severity == Severity.LOW)    deadline = block.timestamp + r.easyDuration;
         else if (b.severity == Severity.MEDIUM) deadline = block.timestamp + r.mediumDuration;
         else                                    deadline = block.timestamp + r.hardDuration;
 
-        b.status        = BountyStatus.ASSIGNED;
-        b.assignedTo    = msg.sender;
-        b.deadline      = deadline;
+        b.status           = BountyStatus.ASSIGNED;
+        b.assignedTo       = msg.sender;
+        b.deadline         = deadline;
         b.contributorStake = msg.value;
 
         hasAttempted[_bountyId][msg.sender] = true;
@@ -431,56 +432,111 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
-     * @notice Org owner marks a bounty complete after verifying the fix on GitHub.
-     *         Contributor receives bounty reward + their stake back.
+     * @notice Step 2 — Submit a pull request URL on-chain.
+     *                  Only the assigned contributor can call this.
+     *                  Status advances to PR_SUBMITTED.
+     * @param _prUrl  e.g. https://github.com/owner/repo/pull/7
      */
-    function completeBounty(uint256 _bountyId) external nonReentrant bountyExists(_bountyId) {
+    function submitPR(uint256 _bountyId, string calldata _prUrl)
+        external
+        bountyExists(_bountyId)
+    {
+        Bounty storage b = bounties[_bountyId];
+        require(b.assignedTo == msg.sender, "Only assigned contributor");
+        require(b.status == BountyStatus.ASSIGNED, "Bounty not in ASSIGNED state");
+        require(bytes(_prUrl).length > 0, "Empty PR URL");
+
+        b.status       = BountyStatus.PR_SUBMITTED;
+        b.prUrl        = _prUrl;
+        b.prSubmittedAt = block.timestamp;
+
+        emit PRSubmitted(_bountyId, msg.sender, _prUrl);
+    }
+
+    /**
+     * @notice Step 3 — Org confirms the PR was merged on GitHub.
+     *                  Status advances to MERGED; contributor can now claim.
+     *                  Only the repo owner can call this.
+     */
+    function approveMerge(uint256 _bountyId)
+        external
+        bountyExists(_bountyId)
+    {
         Bounty storage b = bounties[_bountyId];
         require(msg.sender == repos[b.repoId].owner, "Only repo owner");
-        require(b.status == BountyStatus.ASSIGNED, "Not assigned");
+        require(b.status == BountyStatus.PR_SUBMITTED, "No PR submitted yet");
+
+        b.status = BountyStatus.MERGED;
+
+        emit MergeApproved(_bountyId, msg.sender, b.prUrl);
+    }
+
+    /**
+     * @notice Step 4 — Contributor claims their bounty reward + stake after merge approval.
+     *                  Can only be called once status is MERGED.
+     */
+    function claimBounty(uint256 _bountyId)
+        external
+        nonReentrant
+        bountyExists(_bountyId)
+    {
+        Bounty storage b = bounties[_bountyId];
+        require(b.assignedTo == msg.sender, "Only assigned contributor");
+        require(b.status == BountyStatus.MERGED, "PR not approved yet");
 
         b.status = BountyStatus.COMPLETED;
 
         uint256 stake  = b.contributorStake;
         uint256 payout = b.amount + stake;
 
-        contributorStakes[b.assignedTo] -= stake;
-        _removeBountyFromContributor(b.assignedTo, _bountyId);
+        contributorStakes[msg.sender] -= stake;
+        _removeBountyFromContributor(msg.sender, _bountyId);
 
-        payable(b.assignedTo).transfer(payout);
+        payable(msg.sender).transfer(payout);
 
-        emit BountyCompleted(_bountyId, b.assignedTo, payout);
+        emit BountyClaimed(_bountyId, msg.sender, payout);
     }
 
     /**
-     * @notice If the deadline passes without the org completing the bounty,
-     *         the contributor can call this to get their stake back.
-     *         The bounty is reopened for someone else to take.
+     * @notice Deadline expired without the org approving a merge.
+     *         Contributor gets their stake back. Bounty reopens for someone else.
+     *         Callable when status is ASSIGNED or PR_SUBMITTED and deadline has passed.
      */
-    function claimExpiredBounty(uint256 _bountyId) external nonReentrant bountyExists(_bountyId) {
+    function claimExpiredBounty(uint256 _bountyId)
+        external
+        nonReentrant
+        bountyExists(_bountyId)
+    {
         Bounty storage b = bounties[_bountyId];
         require(b.assignedTo == msg.sender, "Not assigned to you");
-        require(b.status == BountyStatus.ASSIGNED, "Not assigned");
+        require(
+            b.status == BountyStatus.ASSIGNED || b.status == BountyStatus.PR_SUBMITTED,
+            "Not in an expirable state"
+        );
         require(block.timestamp > b.deadline, "Deadline not passed");
 
+        BountyStatus prevStatus = b.status;
         uint256 stake = b.contributorStake;
 
         b.status           = BountyStatus.OPEN;
         b.assignedTo       = address(0);
         b.deadline         = 0;
         b.contributorStake = 0;
+        b.prUrl            = "";
+        b.prSubmittedAt    = 0;
 
+        // bounty reward goes back to repo pool so another contributor can take it
         repos[b.repoId].available += b.amount;
         contributorStakes[msg.sender] -= stake;
         _removeBountyFromContributor(msg.sender, _bountyId);
 
         payable(msg.sender).transfer(stake);
 
-        emit BountyExpired(_bountyId, msg.sender);
+        emit BountyExpired(_bountyId, msg.sender, prevStatus);
     }
 
     /**
-     * @notice Withdraw any stake that is no longer locked (edge case safety valve).
+     * @notice Safety valve: withdraw stake that is no longer locked in any bounty.
      */
     function withdrawStake() external nonReentrant {
         uint256 amount = contributorStakes[msg.sender];
@@ -527,12 +583,14 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
     function isBountyExpired(uint256 _bountyId) external view bountyExists(_bountyId) returns (bool) {
         Bounty storage b = bounties[_bountyId];
-        return b.status == BountyStatus.ASSIGNED && block.timestamp > b.deadline;
+        return (
+            (b.status == BountyStatus.ASSIGNED || b.status == BountyStatus.PR_SUBMITTED) &&
+            block.timestamp > b.deadline
+        );
     }
 
     function getBountyIdByIssueUrl(string calldata _githubIssueUrl) external view returns (uint256) {
-        bytes32 h = keccak256(bytes(_githubIssueUrl));
-        return issueUrlToBountyId[h];
+        return issueUrlToBountyId[keccak256(bytes(_githubIssueUrl))];
     }
 
     function getContractBalance() external view returns (uint256) {
@@ -561,7 +619,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         }
     }
 
-    /// @dev Very naive ASCII lowercase — only needed for the repo URL dedup hash.
+    /// @dev Naive ASCII lowercase for repo URL dedup hashing only.
     function _toLower(string memory _str) internal pure returns (string memory) {
         bytes memory b = bytes(_str);
         for (uint256 i = 0; i < b.length; i++) {
