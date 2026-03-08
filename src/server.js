@@ -14,6 +14,8 @@ app.use(cors({
   origin: [
     "http://localhost:5173",
     "http://localhost:8080",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8080",
     "https://e3f8-2409-40e5-1059-6da9-94c8-55e4-504c-5c6d.ngrok-free.app",
   ],
 }));
@@ -482,6 +484,86 @@ app.get("/api/github/repo-snapshot", async (req, res) => {
       error: error.message || "Failed to fetch repository data from GitHub.",
       details: error.payload || null,
     });
+  }
+});
+
+app.post("/api/github/create-issues", async (req, res) => {
+  const { repoUrl, findings } = req.body;
+
+  if (!findings || !Array.isArray(findings) || findings.length === 0) {
+    return res.status(400).json({ error: "No findings provided." });
+  }
+
+  const parsedRepo = parseRepoInput(repoUrl);
+  if (!parsedRepo) {
+    return res.status(400).json({ error: "Invalid repo URL." });
+  }
+
+  const appId = process.env.GITHUB_APP_ID;
+  const { key: privateKey, error: privateKeyError } = getGithubAppPrivateKey();
+
+  if (!appId) {
+    return res.status(500).json({ error: "Missing GITHUB_APP_ID in backend environment." });
+  }
+  if (privateKeyError || !privateKey) {
+    return res.status(500).json({ error: privateKeyError || "Missing GITHUB_APP_PRIVATE_KEY." });
+  }
+
+  const { owner, repo } = parsedRepo;
+
+  try {
+    const appJwt = createGithubAppJwt(appId, privateKey);
+    const installation = await githubRequest(`/repos/${owner}/${repo}/installation`, { token: appJwt });
+    const tokenResponse = await githubRequest(
+      `/app/installations/${installation.id}/access_tokens`,
+      { token: appJwt, method: "POST" }
+    );
+    const installationToken = tokenResponse?.token;
+    if (!installationToken) throw new Error("Failed to create installation token.");
+
+    const severityEmoji = { CRITICAL: "🔴", HIGH: "🟠", MEDIUM: "🟡", LOW: "🟢", INFO: "🔵" };
+
+    const created = [];
+    for (const finding of findings) {
+      const emoji = severityEmoji[finding.severity] || "⚪";
+      const title = `${emoji} [${finding.severity}] ${finding.type} — ${finding.file}${finding.line ? `:${finding.line}` : ""}`;
+      const body = `## Security Finding: ${finding.type}
+
+**Severity:** \`${finding.severity}\`
+**File:** \`${finding.file}${finding.line ? `:${finding.line}` : ""}\`
+
+### Description
+${finding.description}
+
+### Suggested Fix
+${finding.suggestion || "No suggestion provided."}
+
+---
+*Detected by mergeX AI Security Scanner*`;
+
+      try {
+        const issue = await githubRequest(`/repos/${owner}/${repo}/issues`, {
+          token: installationToken,
+          method: "POST",
+          body: { title, body },
+        });
+        created.push({ number: issue.number, url: issue.html_url, title: issue.title });
+      } catch (issueErr) {
+        console.error(`Failed to create issue for "${finding.type}":`, issueErr.message);
+        created.push({ error: issueErr.message, type: finding.type });
+      }
+    }
+
+    return res.json({ created });
+  } catch (error) {
+    console.error("create-issues failed:", error);
+    if (error.status === 404) {
+      return res.status(404).json({ error: "GitHub App not installed on this repository." });
+    }
+    if (error.status === 403) {
+      return res.status(403).json({ error: "GitHub App lacks issues write permission." });
+    }
+    return res.status(error.status || 500).json({ error: error.message });
   }
 });
 
