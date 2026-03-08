@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { signRequest } from "@worldcoin/idkit-server";
 import crypto from "node:crypto";
+import { registerAuditRoutes } from "./audit.js";
 
 dotenv.config();
 
@@ -704,6 +705,8 @@ Respond ONLY with a JSON object — no markdown fences, no extra text:
     return res.status(err.status || 500).json({ error: err.message });
   }
 });
+
+registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt });
 
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || "127.0.0.1";
