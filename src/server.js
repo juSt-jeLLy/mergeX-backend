@@ -567,6 +567,144 @@ ${finding.suggestion || "No suggestion provided."}
   }
 });
 
+// ── PR Analysis ──────────────────────────────────────────────────────────────
+const parsePRUrl = (url) => {
+  try {
+    const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    if (!m) return null;
+    return { owner: m[1], repo: m[2], prNumber: Number(m[3]) };
+  } catch { return null; }
+};
+
+const parseIssueUrl = (url) => {
+  try {
+    const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+    if (!m) return null;
+    return { owner: m[1], repo: m[2], issueNumber: Number(m[3]) };
+  } catch { return null; }
+};
+
+app.post("/api/analyze-pr", async (req, res) => {
+  const { prUrl, issueUrl, issueTitle, issueDescription } = req.body;
+
+  if (!prUrl) return res.status(400).json({ error: "prUrl is required" });
+
+  const pr = parsePRUrl(prUrl);
+  if (!pr) return res.status(400).json({ error: "Invalid GitHub PR URL" });
+
+  const appId = process.env.GITHUB_APP_ID;
+  const { key: privateKey } = getGithubAppPrivateKey();
+  const fallbackToken = process.env.GITHUB_TOKEN;
+
+  // Resolve a GitHub token (App installation preferred, fallback to PAT)
+  let ghToken = fallbackToken;
+  if (appId && privateKey) {
+    try {
+      const appJwt = createGithubAppJwt(appId, privateKey);
+      const inst = await githubRequest(`/repos/${pr.owner}/${pr.repo}/installation`, { token: appJwt });
+      const tok = await githubRequest(`/app/installations/${inst.id}/access_tokens`, { token: appJwt, method: "POST" });
+      ghToken = tok?.token || fallbackToken;
+    } catch { /* use fallback */ }
+  }
+
+  if (!ghToken) return res.status(500).json({ error: "No GitHub token available" });
+
+  try {
+    // Fetch PR + files in parallel; issue only if URL given
+    const [prData, prFiles, issueData] = await Promise.all([
+      githubRequest(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.prNumber}`, { token: ghToken }),
+      githubRequest(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.prNumber}/files`, { token: ghToken }).catch(() => []),
+      issueUrl ? (() => {
+        const iss = parseIssueUrl(issueUrl);
+        return iss ? githubRequest(`/repos/${iss.owner}/${iss.repo}/issues/${iss.issueNumber}`, { token: ghToken }).catch(() => null) : Promise.resolve(null);
+      })() : Promise.resolve(null),
+    ]);
+
+    // Build diff summary — include meaningful patch per file (40 lines each)
+    const files = Array.isArray(prFiles) ? prFiles : [];
+    const filesSummary = files.slice(0, 15).map((f) => {
+      let patch = "(binary or no patch)";
+      if (f.patch) {
+        const lines = f.patch.split("\n");
+        const truncated = lines.length > 40;
+        patch = lines.slice(0, 40).join("\n") + (truncated ? "\n... (patch truncated at 40 lines)" : "");
+      }
+      return `### ${f.filename} [${f.status}] +${f.additions}/-${f.deletions}\n\`\`\`diff\n${patch}\n\`\`\``;
+    }).join("\n\n");
+
+    const resolvedIssueTitle = issueData?.title || issueTitle || "(not provided)";
+    const resolvedIssueBody = issueData?.body || issueDescription || "(not provided)";
+
+    const prompt = `You are an expert code reviewer for a bug bounty platform. Your job is to deeply analyze a Pull Request and determine whether it correctly fixes the reported issue.
+
+## REPORTED ISSUE
+Title: ${resolvedIssueTitle}
+Description:
+${resolvedIssueBody.slice(0, 1500)}
+
+## PULL REQUEST
+Title: ${prData.title}
+PR Description:
+${(prData.body || "(no description)").slice(0, 800)}
+Stats: ${prData.additions} additions, ${prData.deletions} deletions across ${files.length} file(s)
+
+## CODE CHANGES
+${filesSummary}
+
+## YOUR ANALYSIS TASK
+Review the code changes carefully. Check:
+1. Does the code actually fix the root cause of the issue?
+2. Are there any bugs, security issues, or regressions introduced?
+3. Is the implementation correct and complete?
+4. Are there edge cases not handled?
+
+Respond ONLY with a JSON object — no markdown fences, no extra text:
+{
+  "verdict": "APPROVED" | "NEEDS_WORK" | "REJECTED",
+  "confidence": <number 0-100>,
+  "summary": "<2-3 sentence overall assessment of the PR>",
+  "issueAddressed": <true|false>,
+  "keyPoints": ["<specific finding about the code change>", "..."],
+  "concerns": ["<bug, security issue, or missing case>", "..."],
+  "codeQuality": "<one sentence on code quality, style, and correctness>",
+  "recommendation": "<one clear action for the org — approve, request changes, or reject with reason>"
+}`;
+
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+      body: JSON.stringify({
+        //model: "llama-3.3-70b-versatile",
+        model: "llama-3.1-8b-instant",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 1200,
+        temperature: 0.1,
+      }),
+    });
+
+    const groqData = await groqRes.json();
+    if (!groqRes.ok) return res.status(500).json({ error: "AI analysis failed", details: groqData });
+
+    const rawText = groqData.choices?.[0]?.message?.content || "{}";
+    let analysis;
+    try {
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      analysis = JSON.parse(jsonMatch ? jsonMatch[0] : rawText);
+    } catch {
+      analysis = { verdict: "NEEDS_WORK", confidence: 50, summary: rawText, issueAddressed: false, keyPoints: [], concerns: [], recommendation: "Manual review required" };
+    }
+
+    return res.json({
+      analysis,
+      pr: { title: prData.title, url: prUrl, filesChanged: (Array.isArray(prFiles) ? prFiles : []).length, additions: prData.additions, deletions: prData.deletions },
+      issue: { title: resolvedIssueTitle, url: issueUrl },
+    });
+  } catch (err) {
+    console.error("analyze-pr error:", err);
+    return res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
 const PORT = Number(process.env.PORT || 3001);
 const HOST = process.env.HOST || "127.0.0.1";
 
