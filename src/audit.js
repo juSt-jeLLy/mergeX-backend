@@ -1,8 +1,17 @@
 // ── AI Audit Module ─────────────────────────────────────────────────────────
 // Cross-references GitHub state vs on-chain bounty state to detect discrepancies
 // Pins the audit report to Filecoin via Pinata for verifiable, immutable proof
+// Stores every audit snapshot + CID in a local audit log for traceability.
+
+import fs from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
 
 const STATUS_NAMES = ["OPEN", "ASSIGNED", "PR_SUBMITTED", "MERGED", "COMPLETED", "CANCELLED"];
+
+const AUDIT_LOG_PATH =
+  process.env.AUDIT_LOG_PATH ||
+  path.join(process.cwd(), "data", "audit-logs.json");
 
 async function pinToIPFS(report) {
   const jwt = process.env.PINATA_JWT;
@@ -24,6 +33,42 @@ async function pinToIPFS(report) {
   } catch {
     return null;
   }
+}
+
+const emptyLog = () => ({ entries: [], byRepo: {} });
+
+async function readAuditLog() {
+  try {
+    const raw = await fs.readFile(AUDIT_LOG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return emptyLog();
+    return {
+      entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+      byRepo: parsed.byRepo && typeof parsed.byRepo === "object" ? parsed.byRepo : {},
+    };
+  } catch (err) {
+    if (err?.code === "ENOENT") return emptyLog();
+    console.warn("audit log read failed:", err);
+    return emptyLog();
+  }
+}
+
+async function writeAuditLog(log) {
+  await fs.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+  await fs.writeFile(AUDIT_LOG_PATH, JSON.stringify(log, null, 2));
+}
+
+async function appendAuditLog(entry) {
+  const log = await readAuditLog();
+  log.entries.push(entry);
+  if (entry?.repoUrl) {
+    if (!Array.isArray(log.byRepo[entry.repoUrl])) {
+      log.byRepo[entry.repoUrl] = [];
+    }
+    log.byRepo[entry.repoUrl].push(entry);
+  }
+  await writeAuditLog(log);
+  return entry;
 }
 
 async function resolveGithubToken({ owner, repo, githubRequest, getGithubAppPrivateKey, createGithubAppJwt }) {
@@ -78,9 +123,13 @@ async function fetchMergedPRs(owner, repo, ghToken, githubRequest) {
   return merged;
 }
 
-function detectDiscrepancies(allIssues, mergedPRs, bounties) {
+function detectDiscrepancies(allIssues, mergedPRs, bounties, opts = {}) {
   const bountyByIssueUrl = new Map();
   const bountyByPrUrl = new Map();
+  const hasOnChainData =
+    typeof opts.hasOnChainData === "boolean"
+      ? opts.hasOnChainData
+      : Array.isArray(bounties) && bounties.length > 0;
 
   for (const b of bounties) {
     if (b.githubIssueUrl) bountyByIssueUrl.set(b.githubIssueUrl, b);
@@ -90,16 +139,18 @@ function detectDiscrepancies(allIssues, mergedPRs, bounties) {
   const discrepancies = [];
 
   // Check 1: Open issue with no on-chain bounty
-  for (const issue of allIssues.filter(i => i.state === "open")) {
-    if (!bountyByIssueUrl.has(issue.html_url)) {
-      discrepancies.push({
-        type: "UNREGISTERED_OPEN_ISSUE",
-        severity: "LOW",
-        issueNumber: issue.number,
-        issueTitle: issue.title,
-        issueUrl: issue.html_url,
-        description: `Issue #${issue.number} "${issue.title}" is open on GitHub but has no on-chain bounty registered.`,
-      });
+  if (hasOnChainData) {
+    for (const issue of allIssues.filter(i => i.state === "open")) {
+      if (!bountyByIssueUrl.has(issue.html_url)) {
+        discrepancies.push({
+          type: "UNREGISTERED_OPEN_ISSUE",
+          severity: "LOW",
+          issueNumber: issue.number,
+          issueTitle: issue.title,
+          issueUrl: issue.html_url,
+          description: `Issue #${issue.number} "${issue.title}" is open on GitHub but has no on-chain bounty registered.`,
+        });
+      }
     }
   }
 
@@ -221,55 +272,157 @@ Respond ONLY with valid JSON, no markdown:
   }
 }
 
+export async function runAudit({
+  repoUrl,
+  bounties = [],
+  event = null,
+  githubRequest,
+  getGithubAppPrivateKey,
+  createGithubAppJwt,
+}) {
+  if (!repoUrl) throw new Error("repoUrl is required");
+
+  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (!match) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repo] = match;
+
+  const ghToken = await resolveGithubToken({
+    owner,
+    repo,
+    githubRequest,
+    getGithubAppPrivateKey,
+    createGithubAppJwt,
+  });
+  if (!ghToken) throw new Error("No GitHub token available");
+
+  const [allIssues, mergedPRs] = await Promise.all([
+    fetchAllIssues(owner, repo, ghToken, githubRequest),
+    fetchMergedPRs(owner, repo, ghToken, githubRequest),
+  ]);
+
+  const hasOnChainData = Array.isArray(bounties) && bounties.length > 0;
+  const discrepancies = detectDiscrepancies(allIssues, mergedPRs, bounties, {
+    hasOnChainData,
+  });
+
+  const stats = {
+    totalIssues: allIssues.length,
+    mergedPRs: mergedPRs.length,
+    discrepanciesFound: discrepancies.length,
+    critical: discrepancies.filter((d) => d.severity === "CRITICAL").length,
+    high: discrepancies.filter((d) => d.severity === "HIGH").length,
+    medium: discrepancies.filter((d) => d.severity === "MEDIUM").length,
+    low: discrepancies.filter((d) => d.severity === "LOW").length,
+  };
+
+  const aiAnalysis = await runAIAnalysis(discrepancies, repoUrl, stats);
+
+  const issuesSnapshot = allIssues.map((issue) => ({
+    number: issue.number,
+    title: issue.title,
+    state: issue.state,
+    url: issue.html_url,
+    user: issue.user?.login || "unknown",
+    createdAt: issue.created_at,
+    updatedAt: issue.updated_at,
+  }));
+
+  const mergedPRsSnapshot = mergedPRs.map((pr) => ({
+    number: pr.number,
+    title: pr.title,
+    url: pr.html_url,
+    user: pr.user?.login || "unknown",
+    mergedAt: pr.merged_at,
+    updatedAt: pr.updated_at,
+  }));
+
+  const bountiesSnapshot = Array.isArray(bounties)
+    ? bounties.map((b) => ({
+        id: b.id?.toString?.() ?? b.id,
+        status: b.status,
+        githubIssueUrl: b.githubIssueUrl,
+        prUrl: b.prUrl,
+        amount: b.amount,
+        title: b.title,
+        severity: b.severity,
+      }))
+    : [];
+
+  const timestamp = new Date().toISOString();
+
+  const report = {
+    repoUrl,
+    timestamp,
+    event,
+    stats,
+    discrepancies,
+    aiAnalysis,
+    snapshot: {
+      issues: issuesSnapshot,
+      mergedPRs: mergedPRsSnapshot,
+      bounties: bountiesSnapshot,
+      hasOnChainData,
+    },
+  };
+
+  const cid = await pinToIPFS(report);
+
+  const logEntry = {
+    id: crypto.randomUUID(),
+    repoUrl,
+    timestamp,
+    event,
+    cid,
+    stats,
+    discrepanciesCount: discrepancies.length,
+    hasOnChainData,
+  };
+
+  await appendAuditLog(logEntry);
+
+  console.log(
+    `[audit] ${repoUrl} — ${discrepancies.length} discrepancies${cid ? ` — CID: ${cid}` : ""}`
+  );
+
+  return { report: { ...report, cid }, cid, logEntry };
+}
+
 export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt }) {
   app.post("/api/audit-repo", async (req, res) => {
-    const { repoUrl, bounties = [] } = req.body;
+    const { repoUrl, bounties = [], event = null } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "repoUrl is required" });
 
-    const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-    if (!match) return res.status(400).json({ error: "Invalid GitHub repo URL" });
-    const [, owner, repo] = match;
-
     try {
-      const ghToken = await resolveGithubToken({
-        owner, repo, githubRequest, getGithubAppPrivateKey, createGithubAppJwt,
-      });
-      if (!ghToken) return res.status(500).json({ error: "No GitHub token available" });
-
-      const [allIssues, mergedPRs] = await Promise.all([
-        fetchAllIssues(owner, repo, ghToken, githubRequest),
-        fetchMergedPRs(owner, repo, ghToken, githubRequest),
-      ]);
-
-      const discrepancies = detectDiscrepancies(allIssues, mergedPRs, bounties);
-
-      const stats = {
-        totalIssues: allIssues.length,
-        mergedPRs: mergedPRs.length,
-        discrepanciesFound: discrepancies.length,
-        critical: discrepancies.filter(d => d.severity === "CRITICAL").length,
-        high: discrepancies.filter(d => d.severity === "HIGH").length,
-        medium: discrepancies.filter(d => d.severity === "MEDIUM").length,
-        low: discrepancies.filter(d => d.severity === "LOW").length,
-      };
-
-      const aiAnalysis = await runAIAnalysis(discrepancies, repoUrl, stats);
-
-      const report = {
+      const { report } = await runAudit({
         repoUrl,
-        timestamp: new Date().toISOString(),
-        stats,
-        discrepancies,
-        aiAnalysis,
-      };
-
-      const cid = await pinToIPFS(report);
-
-      console.log(`[audit] ${repoUrl} — ${discrepancies.length} discrepancies${cid ? ` — CID: ${cid}` : ""}`);
-      return res.json({ ...report, cid });
-
+        bounties,
+        event,
+        githubRequest,
+        getGithubAppPrivateKey,
+        createGithubAppJwt,
+      });
+      return res.json(report);
     } catch (err) {
       console.error("audit-repo error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/audit-logs", async (req, res) => {
+    try {
+      const { repoUrl, limit } = req.query;
+      const log = await readAuditLog();
+      let entries = Array.isArray(log.entries) ? log.entries : [];
+      if (repoUrl) {
+        entries = Array.isArray(log.byRepo?.[repoUrl]) ? log.byRepo[repoUrl] : [];
+      }
+      const limitNum = Number(limit || 0);
+      if (limitNum > 0 && entries.length > limitNum) {
+        entries = entries.slice(-limitNum);
+      }
+      return res.json({ entries });
+    } catch (err) {
+      console.error("audit-logs error:", err);
       return res.status(500).json({ error: err.message });
     }
   });

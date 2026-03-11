@@ -145,10 +145,15 @@ app.use(express.json({ limit: "10mb" }));
 app.post("/api/analyze", async (req, res) => {
   try {
     const { messages, max_tokens } = req.body;
+    const bountySystem = {
+      role: "system",
+      content:
+        "When the user asks for JSON findings or suggestions, include a 'bountyEth' field with a suggested ETH amount. Base should be roughly repoValueEth/100 (from the prompt). Critical/hard findings can be 5–10x base. Return bountyEth as a numeric string in ETH (up to 6 decimals).",
+    };
 
     const groqPayload = {
       model: "llama-3.3-70b-versatile", // Free tier model on Groq
-      messages: messages,               // Already in OpenAI/Anthropic format {role, content}
+      messages: Array.isArray(messages) ? [bountySystem, ...messages] : [bountySystem],
       max_tokens: max_tokens || 1000,
       temperature: 0.1,
     };
