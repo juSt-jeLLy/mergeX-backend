@@ -134,6 +134,40 @@ async function storeAuditOnFilecoin(report, repoUrl) {
   };
 }
 
+function toBountiesSnapshot(bounties) {
+  if (!Array.isArray(bounties)) return [];
+  return bounties.map((b) => ({
+    id: b.id?.toString?.() ?? b.id,
+    status: b.status,
+    githubIssueUrl: b.githubIssueUrl,
+    prUrl: b.prUrl,
+    amount: b.amount,
+    title: b.title,
+    severity: b.severity,
+  }));
+}
+
+async function storeEventAudit({ repoUrl, bounties, event }) {
+  const timestamp = new Date().toISOString();
+  const report = {
+    repoUrl,
+    timestamp,
+    event,
+    snapshot: {
+      bounties: toBountiesSnapshot(bounties),
+      hasOnChainData: Array.isArray(bounties) && bounties.length > 0,
+    },
+  };
+
+  const storage = await storeAuditOnFilecoin(report, repoUrl);
+  const cid = storage?.pieceCid || null;
+  return {
+    report: { ...report, cid, storage },
+    cid,
+    storage,
+  };
+}
+
 async function listAuditLogsFromFilecoin({ repoUrl, limit = 50 }) {
   const { rpcUrl, chainId, account } = getFilecoinConfig();
   const client = createPublicClient({
@@ -442,15 +476,7 @@ export async function runAudit({
   }));
 
   const bountiesSnapshot = Array.isArray(bounties)
-    ? bounties.map((b) => ({
-        id: b.id?.toString?.() ?? b.id,
-        status: b.status,
-        githubIssueUrl: b.githubIssueUrl,
-        prUrl: b.prUrl,
-        amount: b.amount,
-        title: b.title,
-        severity: b.severity,
-      }))
+    ? toBountiesSnapshot(bounties)
     : [];
 
   const timestamp = new Date().toISOString();
@@ -488,10 +514,14 @@ export async function runAudit({
 
 export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt }) {
   app.post("/api/audit-repo", async (req, res) => {
-    const { repoUrl, bounties = [], event = null } = req.body;
+    const { repoUrl, bounties = [], event = null, eventOnly = false } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "repoUrl is required" });
 
     try {
+      if (eventOnly) {
+        const { report } = await storeEventAudit({ repoUrl, bounties, event });
+        return res.json(report);
+      }
       const { report } = await runAudit({
         repoUrl,
         bounties,
@@ -503,6 +533,14 @@ export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey
       return res.json(report);
     } catch (err) {
       console.error("audit-repo error:", err);
+      if (event) {
+        try {
+          const { report } = await storeEventAudit({ repoUrl, bounties, event });
+          return res.json({ ...report, auditMode: "event_only_fallback", storageError: err.message });
+        } catch (fallbackErr) {
+          console.error("audit-repo fallback error:", fallbackErr);
+        }
+      }
       return res.status(500).json({ error: err.message });
     }
   });
