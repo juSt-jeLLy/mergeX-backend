@@ -148,7 +148,7 @@ app.post("/api/analyze", async (req, res) => {
     const bountySystem = {
       role: "system",
       content:
-        "When the user asks for JSON findings or suggestions, include a 'bountyEth' field with a suggested ETH amount. Base should be roughly repoValueEth/100 (from the prompt). Critical/hard findings can be 5–10x base. Return bountyEth as a numeric string in ETH (up to 6 decimals).",
+        "When the user asks for JSON findings or suggestions, always include a 'bountyEth' field. bountyEth must be between 0.0001 and 0.0005 ETH. Use severity/priority mapping: CRITICAL=0.0005, HIGH=0.0004, MEDIUM=0.0003, LOW=0.0002, INFO=0.0001. For improvements use priority mapping: HIGH=0.0005, MEDIUM=0.0003, LOW=0.0001. Return bountyEth as a numeric string in ETH (up to 6 decimals).",
     };
 
     const groqPayload = {
