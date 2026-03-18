@@ -1,74 +1,213 @@
 // ── AI Audit Module ─────────────────────────────────────────────────────────
 // Cross-references GitHub state vs on-chain bounty state to detect discrepancies
-// Pins the audit report to Filecoin via Pinata for verifiable, immutable proof
-// Stores every audit snapshot + CID in a local audit log for traceability.
-
-import fs from "node:fs/promises";
-import path from "node:path";
+// Stores the audit report to Filecoin via Synapse (store/pull/commit)
 import crypto from "node:crypto";
+import { Synapse, getChain } from "@filoz/synapse-sdk";
+import { createPublicClient, http } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { getPdpDataSets, getAllPieceMetadata } from "@filoz/synapse-core/warm-storage";
+import { calculate as calculatePieceCID, parse as parsePieceCID } from "@filoz/synapse-core/piece";
+import { resolvePieceUrl } from "@filoz/synapse-core/piece";
 
 const STATUS_NAMES = ["OPEN", "ASSIGNED", "PR_SUBMITTED", "MERGED", "COMPLETED", "CANCELLED"];
 
-const AUDIT_LOG_PATH =
-  process.env.AUDIT_LOG_PATH ||
-  path.join(process.cwd(), "data", "audit-logs.json");
+let synapseClient = null;
+let synapsePromise = null;
 
-async function pinToIPFS(report) {
-  const jwt = process.env.PINATA_JWT;
-  if (!jwt) return null;
-  try {
-    const res = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${jwt}`,
-      },
-      body: JSON.stringify({
-        pinataContent: report,
-        pinataMetadata: { name: `mergeX-audit-${Date.now()}` },
-      }),
+function normalizePrivateKey(raw) {
+  if (!raw) return null;
+  const trimmed = raw.trim().replace(/^['"]|['"]$/g, "");
+  if (trimmed.length === 42) {
+    throw new Error("FILECOIN_PRIVATE_KEY looks like an address. Provide the 32-byte private key (0x...).");
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(trimmed)) {
+    throw new Error("FILECOIN_PRIVATE_KEY must be a 32-byte hex private key (0x + 64 hex chars).");
+  }
+  return trimmed;
+}
+
+async function getSynapseClient() {
+  if (synapseClient) return synapseClient;
+  if (synapsePromise) return synapsePromise;
+
+  const privateKey = normalizePrivateKey(process.env.FILECOIN_PRIVATE_KEY);
+  if (!privateKey) throw new Error("FILECOIN_PRIVATE_KEY is required for Filecoin storage.");
+
+  const rpcUrl = process.env.FILECOIN_RPC_URL || "https://api.calibration.node.glif.io/rpc/v1";
+  const chainId = Number(process.env.FILECOIN_CHAIN_ID || 314159);
+  const account = privateKeyToAccount(privateKey);
+
+  synapsePromise = Promise.resolve(
+    Synapse.create({
+      account,
+      chain: getChain(chainId),
+      transport: http(rpcUrl),
+      withCDN: false,
+    })
+  )
+    .then((client) => {
+      synapseClient = client;
+      return client;
+    })
+    .catch((err) => {
+      synapsePromise = null;
+      throw new Error(`Synapse init failed: ${err?.message || err}`);
     });
-    const data = await res.json();
-    return data.IpfsHash || null;
-  } catch {
-    return null;
+
+  return synapsePromise;
+}
+
+function getFilecoinConfig() {
+  const privateKey = normalizePrivateKey(process.env.FILECOIN_PRIVATE_KEY);
+  if (!privateKey) {
+    throw new Error("FILECOIN_PRIVATE_KEY is required for Filecoin storage.");
   }
+  const rpcUrl = process.env.FILECOIN_RPC_URL || "https://api.calibration.node.glif.io/rpc/v1";
+  const chainId = Number(process.env.FILECOIN_CHAIN_ID || 314159);
+  const account = privateKeyToAccount(privateKey);
+  return { privateKey, rpcUrl, chainId, account };
 }
 
-const emptyLog = () => ({ entries: [], byRepo: {} });
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function readAuditLog() {
-  try {
-    const raw = await fs.readFile(AUDIT_LOG_PATH, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return emptyLog();
-    return {
-      entries: Array.isArray(parsed.entries) ? parsed.entries : [],
-      byRepo: parsed.byRepo && typeof parsed.byRepo === "object" ? parsed.byRepo : {},
-    };
-  } catch (err) {
-    if (err?.code === "ENOENT") return emptyLog();
-    console.warn("audit log read failed:", err);
-    return emptyLog();
-  }
-}
-
-async function writeAuditLog(log) {
-  await fs.mkdir(path.dirname(AUDIT_LOG_PATH), { recursive: true });
-  await fs.writeFile(AUDIT_LOG_PATH, JSON.stringify(log, null, 2));
-}
-
-async function appendAuditLog(entry) {
-  const log = await readAuditLog();
-  log.entries.push(entry);
-  if (entry?.repoUrl) {
-    if (!Array.isArray(log.byRepo[entry.repoUrl])) {
-      log.byRepo[entry.repoUrl] = [];
+async function uploadWithRetry(synapse, data, options = {}, maxAttempts = 3) {
+  let attempt = 0;
+  let lastError = null;
+  while (attempt < maxAttempts) {
+    try {
+      return await synapse.storage.upload(data, options);
+    } catch (err) {
+      lastError = err;
+      const delay = Math.min(15000, 1000 * Math.pow(2, attempt));
+      await sleep(delay);
+      attempt += 1;
     }
-    log.byRepo[entry.repoUrl].push(entry);
   }
-  await writeAuditLog(log);
-  return entry;
+  throw lastError || new Error("Filecoin upload failed");
+}
+
+async function storeAuditOnFilecoin(report, repoUrl) {
+  const json = JSON.stringify(report);
+  const encoder = new TextEncoder();
+  let bytes = encoder.encode(json);
+  if (bytes.length < 127) {
+    const pad = " ".repeat(127 - bytes.length);
+    bytes = encoder.encode(json + pad);
+  }
+
+  const auditId = crypto.randomUUID();
+  const synapse = await getSynapseClient();
+  const copies = Math.max(1, Number(process.env.SYNAPSE_COPIES || 1));
+  const calculatedCid = calculatePieceCID(bytes);
+  const metadata = {
+    source: "mergeX-audit",
+    repoUrl: repoUrl || "",
+    timestamp: new Date().toISOString(),
+    auditId,
+    pieceCid: calculatedCid?.toString?.() ?? String(calculatedCid),
+  };
+
+  const upload = await uploadWithRetry(
+    synapse,
+    bytes,
+    {
+      count: copies,
+      pieceMetadata: metadata,
+    },
+    Number(process.env.SYNAPSE_RETRIES || 3)
+  );
+
+  return {
+    pieceCid: upload.pieceCid?.toString?.() ?? String(upload.pieceCid),
+    size: upload.size,
+    copies: upload.copies?.length ?? 0,
+    providers: (upload.copies || []).map((copy) => ({
+      providerId: copy.providerId?.toString?.() ?? String(copy.providerId),
+      dataSetId: copy.dataSetId?.toString?.() ?? String(copy.dataSetId),
+      role: copy.role,
+      retrievalUrl: copy.retrievalUrl,
+    })),
+    failures: upload.failures || [],
+    auditId,
+    timestamp: metadata.timestamp,
+    repoUrl: metadata.repoUrl,
+  };
+}
+
+function toBountiesSnapshot(bounties) {
+  if (!Array.isArray(bounties)) return [];
+  return bounties.map((b) => ({
+    id: b.id?.toString?.() ?? b.id,
+    status: b.status,
+    githubIssueUrl: b.githubIssueUrl,
+    prUrl: b.prUrl,
+    amount: b.amount,
+    title: b.title,
+    severity: b.severity,
+  }));
+}
+
+async function storeEventAudit({ repoUrl, bounties, event }) {
+  const timestamp = new Date().toISOString();
+  const report = {
+    repoUrl,
+    timestamp,
+    event,
+    snapshot: {
+      bounties: toBountiesSnapshot(bounties),
+      hasOnChainData: Array.isArray(bounties) && bounties.length > 0,
+    },
+  };
+
+  const storage = await storeAuditOnFilecoin(report, repoUrl);
+  const cid = storage?.pieceCid || null;
+  return {
+    report: { ...report, cid, storage },
+    cid,
+    storage,
+  };
+}
+
+async function listAuditLogsFromFilecoin({ repoUrl, limit = 50 }) {
+  const { rpcUrl, chainId, account } = getFilecoinConfig();
+  const client = createPublicClient({
+    chain: getChain(chainId),
+    transport: http(rpcUrl),
+  });
+
+  const datasets = await getPdpDataSets(client, { address: account.address });
+  const entries = [];
+
+  for (const dataset of datasets) {
+    if (dataset.pdpEndEpoch && dataset.pdpEndEpoch !== 0n) continue;
+    const pieceCount = Number(dataset.activePieceCount ?? 0n);
+    for (let pieceId = 0; pieceId < pieceCount; pieceId += 1) {
+      const metadata = await getAllPieceMetadata(client, {
+        dataSetId: dataset.dataSetId,
+        pieceId: BigInt(pieceId),
+      });
+      if (!metadata || metadata.source !== "mergeX-audit") continue;
+      if (repoUrl && metadata.repoUrl !== repoUrl) continue;
+      entries.push({
+        pieceCid: metadata.pieceCid || null,
+        repoUrl: metadata.repoUrl || "",
+        timestamp: metadata.timestamp || null,
+        auditId: metadata.auditId || null,
+        legacy: !metadata.pieceCid,
+        dataSetId: dataset.dataSetId.toString(),
+        providerName: dataset.provider?.name || "",
+        providerId: dataset.provider?.id?.toString?.() || "",
+      });
+    }
+  }
+
+  entries.sort((a, b) => {
+    const at = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+    const bt = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+    return bt - at;
+  });
+
+  return limit > 0 ? entries.slice(0, limit) : entries;
 }
 
 async function resolveGithubToken({ owner, repo, githubRequest, getGithubAppPrivateKey, createGithubAppJwt }) {
@@ -337,15 +476,7 @@ export async function runAudit({
   }));
 
   const bountiesSnapshot = Array.isArray(bounties)
-    ? bounties.map((b) => ({
-        id: b.id?.toString?.() ?? b.id,
-        status: b.status,
-        githubIssueUrl: b.githubIssueUrl,
-        prUrl: b.prUrl,
-        amount: b.amount,
-        title: b.title,
-        severity: b.severity,
-      }))
+    ? toBountiesSnapshot(bounties)
     : [];
 
   const timestamp = new Date().toISOString();
@@ -365,34 +496,32 @@ export async function runAudit({
     },
   };
 
-  const cid = await pinToIPFS(report);
-
-  const logEntry = {
-    id: crypto.randomUUID(),
-    repoUrl,
-    timestamp,
-    event,
-    cid,
-    stats,
-    discrepanciesCount: discrepancies.length,
-    hasOnChainData,
-  };
-
-  await appendAuditLog(logEntry);
+  let storage = null;
+  let storageError = null;
+  try {
+    storage = await storeAuditOnFilecoin(report, repoUrl);
+  } catch (err) {
+    storageError = err?.message || String(err);
+  }
+  const cid = storage?.pieceCid || null;
 
   console.log(
-    `[audit] ${repoUrl} — ${discrepancies.length} discrepancies${cid ? ` — CID: ${cid}` : ""}`
+    `[audit] ${repoUrl} — ${discrepancies.length} discrepancies${cid ? ` — CID: ${cid}` : ""}${storageError ? ` — storage error: ${storageError}` : ""}`
   );
 
-  return { report: { ...report, cid }, cid, logEntry };
+  return { report: { ...report, cid, storage, storageError }, cid, storage, storageError };
 }
 
 export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt }) {
   app.post("/api/audit-repo", async (req, res) => {
-    const { repoUrl, bounties = [], event = null } = req.body;
+    const { repoUrl, bounties = [], event = null, eventOnly = false } = req.body;
     if (!repoUrl) return res.status(400).json({ error: "repoUrl is required" });
 
     try {
+      if (eventOnly) {
+        const { report } = await storeEventAudit({ repoUrl, bounties, event });
+        return res.json(report);
+      }
       const { report } = await runAudit({
         repoUrl,
         bounties,
@@ -404,6 +533,14 @@ export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey
       return res.json(report);
     } catch (err) {
       console.error("audit-repo error:", err);
+      if (event) {
+        try {
+          const { report } = await storeEventAudit({ repoUrl, bounties, event });
+          return res.json({ ...report, auditMode: "event_only_fallback", storageError: err.message });
+        } catch (fallbackErr) {
+          console.error("audit-repo fallback error:", fallbackErr);
+        }
+      }
       return res.status(500).json({ error: err.message });
     }
   });
@@ -411,18 +548,74 @@ export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey
   app.get("/api/audit-logs", async (req, res) => {
     try {
       const { repoUrl, limit } = req.query;
-      const log = await readAuditLog();
-      let entries = Array.isArray(log.entries) ? log.entries : [];
-      if (repoUrl) {
-        entries = Array.isArray(log.byRepo?.[repoUrl]) ? log.byRepo[repoUrl] : [];
-      }
-      const limitNum = Number(limit || 0);
-      if (limitNum > 0 && entries.length > limitNum) {
-        entries = entries.slice(-limitNum);
-      }
+      const entries = await listAuditLogsFromFilecoin({
+        repoUrl: typeof repoUrl === "string" ? repoUrl : null,
+        limit: Number(limit || 50),
+      });
       return res.json({ entries });
     } catch (err) {
       console.error("audit-logs error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/audit-download", async (req, res) => {
+    try {
+      const { pieceCid } = req.query;
+      if (typeof pieceCid !== "string" || !pieceCid.trim()) {
+        return res.status(400).json({ error: "pieceCid is required" });
+      }
+
+      const { rpcUrl, chainId, account } = getFilecoinConfig();
+      const client = createPublicClient({
+        chain: getChain(chainId),
+        transport: http(rpcUrl),
+      });
+
+      const url = await resolvePieceUrl({
+        client,
+        address: account.address,
+        pieceCid: parsePieceCID(pieceCid.trim()),
+      });
+
+      const rsp = await fetch(url);
+      if (!rsp.ok) throw new Error(`Failed to fetch piece content (${rsp.status})`);
+
+      const buf = Buffer.from(await rsp.arrayBuffer());
+      res.setHeader("Content-Type", rsp.headers.get("content-type") || "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename=\"audit-${pieceCid.trim()}.json\"`);
+      return res.send(buf);
+    } catch (err) {
+      console.error("audit-download error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/audit-content", async (req, res) => {
+    try {
+      const { pieceCid } = req.query;
+      if (typeof pieceCid !== "string" || !pieceCid.trim()) {
+        return res.status(400).json({ error: "pieceCid is required" });
+      }
+
+      const { rpcUrl, chainId, account } = getFilecoinConfig();
+      const client = createPublicClient({
+        chain: getChain(chainId),
+        transport: http(rpcUrl),
+      });
+
+      const url = await resolvePieceUrl({
+        client,
+        address: account.address,
+        pieceCid: parsePieceCID(pieceCid.trim()),
+      });
+
+      const rsp = await fetch(url);
+      if (!rsp.ok) throw new Error(`Failed to fetch piece content (${rsp.status})`);
+      const text = (await rsp.text()).trimEnd();
+      return res.json({ content: text });
+    } catch (err) {
+      console.error("audit-content error:", err);
       return res.status(500).json({ error: err.message });
     }
   });

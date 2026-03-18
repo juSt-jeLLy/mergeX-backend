@@ -11,11 +11,14 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@filoz/synapse-core": "^0.2.3",
+    "@filoz/synapse-sdk": "^0.38.0",
     "@worldcoin/idkit-server": "^1.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "hardhat": "^3.1.11",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "viem": "^2.46.3"
   }
 }

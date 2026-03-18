@@ -18,9 +18,11 @@ GITHUB_APP_ID=3024176
 GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
 GITHUB_APP_SLUG=pltestforplgenesis
 GITHUB_APP_INSTALL_URL=https://github.com/apps/pltestforplgenesis/installations/new
-PINATA_JWT=your_pinata_jwt
-# Optional: where audit logs are stored
-# AUDIT_LOG_PATH=./data/audit-logs.json
+# Filecoin Synapse
+FILECOIN_PRIVATE_KEY=0x...
+FILECOIN_RPC_URL=https://api.calibration.node.glif.io/rpc/v1
+FILECOIN_CHAIN_ID=314159
+SYNAPSE_COPIES=1
 ```
 
 Important:
@@ -51,11 +53,7 @@ If app is not installed on the target repo, response includes an install URL for
 ## Audit Logs + Filecoin
 
 1. Runs the audit snapshot.
-2. Pins the report JSON to Filecoin via Pinata (`PINATA_JWT`).
-3. Appends a local log entry at `data/audit-logs.json`.
+2. Stores the report JSON to Filecoin via Synapse (store/pull/commit).
+3. No local storage is used; Filecoin is the source of truth.
 
-Fetch audit logs:
-
-```bash
-curl "http://127.0.0.1:3001/api/audit-logs?repoUrl=https://github.com/OWNER/REPO&limit=20"
-```
+Audit logs are stored on Filecoin and returned in the audit response.
