@@ -709,6 +709,130 @@ Respond ONLY with a JSON object — no markdown fences, no extra text:
   }
 });
 
+// ── Merge PR (GitHub) ─────────────────────────────────────────────────────────
+app.post("/api/github/merge-pr", async (req, res) => {
+  const { prUrl, mergeMethod } = req.body;
+  if (!prUrl) return res.status(400).json({ error: "prUrl is required" });
+
+  const pr = parsePRUrl(prUrl);
+  if (!pr) return res.status(400).json({ error: "Invalid GitHub PR URL" });
+
+  const appId = process.env.GITHUB_APP_ID;
+  const { key: privateKey } = getGithubAppPrivateKey();
+  const fallbackToken = process.env.GITHUB_TOKEN;
+
+  const allowedMethods = new Set(["merge", "squash", "rebase"]);
+  const method = allowedMethods.has(mergeMethod) ? mergeMethod : "merge";
+
+  let ghToken = fallbackToken;
+  if (appId && privateKey) {
+    try {
+      const appJwt = createGithubAppJwt(appId, privateKey);
+      const installation = await githubRequest(`/repos/${pr.owner}/${pr.repo}/installation`, { token: appJwt });
+      const tok = await githubRequest(`/app/installations/${installation.id}/access_tokens`, { token: appJwt, method: "POST" });
+      ghToken = tok?.token || fallbackToken;
+    } catch (err) {
+      if (err?.status === 404) {
+        let installUrl = process.env.GITHUB_APP_INSTALL_URL || null;
+        let appSlug = process.env.GITHUB_APP_SLUG || null;
+        if (!installUrl) {
+          try {
+            const appInfo = await githubRequest("/app", { token: createGithubAppJwt(appId, privateKey) });
+            appSlug = appInfo?.slug || appSlug;
+            if (appSlug) installUrl = `https://github.com/apps/${appSlug}/installations/new`;
+          } catch {}
+        }
+        return res.status(404).json({
+          error: "GitHub App is not installed on this repository yet.",
+          notInstalled: true,
+          owner: pr.owner,
+          repo: pr.repo,
+          appSlug,
+          installUrl,
+        });
+      }
+    }
+  }
+
+  if (!ghToken) return res.status(500).json({ error: "No GitHub token available" });
+
+  try {
+    const payload = await githubRequest(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.prNumber}/merge`, {
+      token: ghToken,
+      method: "PUT",
+      body: { merge_method: method },
+    });
+    return res.json({ merged: payload?.merged ?? false, message: payload?.message, sha: payload?.sha });
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      error: err.message || "Failed to merge PR",
+      details: err.payload || null,
+    });
+  }
+});
+
+// ── PR Status (GitHub) ───────────────────────────────────────────────────────
+app.get("/api/github/pr-status", async (req, res) => {
+  const prUrl = typeof req.query.prUrl === "string" ? req.query.prUrl : "";
+  if (!prUrl) return res.status(400).json({ error: "prUrl is required" });
+
+  const pr = parsePRUrl(prUrl);
+  if (!pr) return res.status(400).json({ error: "Invalid GitHub PR URL" });
+
+  const appId = process.env.GITHUB_APP_ID;
+  const { key: privateKey } = getGithubAppPrivateKey();
+  const fallbackToken = process.env.GITHUB_TOKEN;
+
+  let ghToken = fallbackToken;
+  if (appId && privateKey) {
+    try {
+      const appJwt = createGithubAppJwt(appId, privateKey);
+      const installation = await githubRequest(`/repos/${pr.owner}/${pr.repo}/installation`, { token: appJwt });
+      const tok = await githubRequest(`/app/installations/${installation.id}/access_tokens`, { token: appJwt, method: "POST" });
+      ghToken = tok?.token || fallbackToken;
+    } catch (err) {
+      if (err?.status === 404) {
+        let installUrl = process.env.GITHUB_APP_INSTALL_URL || null;
+        let appSlug = process.env.GITHUB_APP_SLUG || null;
+        if (!installUrl) {
+          try {
+            const appInfo = await githubRequest("/app", { token: createGithubAppJwt(appId, privateKey) });
+            appSlug = appInfo?.slug || appSlug;
+            if (appSlug) installUrl = `https://github.com/apps/${appSlug}/installations/new`;
+          } catch {}
+        }
+        return res.status(404).json({
+          error: "GitHub App is not installed on this repository yet.",
+          notInstalled: true,
+          owner: pr.owner,
+          repo: pr.repo,
+          appSlug,
+          installUrl,
+        });
+      }
+    }
+  }
+
+  if (!ghToken) return res.status(500).json({ error: "No GitHub token available" });
+
+  try {
+    const prData = await githubRequest(`/repos/${pr.owner}/${pr.repo}/pulls/${pr.prNumber}`, { token: ghToken });
+    return res.json({
+      merged: !!prData?.merged,
+      mergeable: prData?.mergeable ?? null,
+      state: prData?.state || null,
+      number: prData?.number,
+      title: prData?.title,
+      html_url: prData?.html_url,
+    });
+  } catch (err) {
+    return res.status(err.status || 500).json({
+      error: err.message || "Failed to load PR status",
+      details: err.payload || null,
+    });
+  }
+});
+
 registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt });
 
 const PORT = Number(process.env.PORT || 3001);
