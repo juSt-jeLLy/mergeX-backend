@@ -126,13 +126,24 @@ import dotenv from "dotenv"
 
 dotenv.config();
 const app = express();
-const PORT = 3005;
-
+const PORT = Number(process.env.PORT || 3005);
+const HOST = process.env.HOST || "0.0.0.0";
 const localOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const configuredOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const allowedOrigins = new Set(configuredOrigins);
+const vercelFrontendPattern = /^https:\/\/mergex-frontend(?:-[a-z0-9-]+)?\.vercel\.app$/i;
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || localOriginPattern.test(origin)) {
+      if (
+        !origin ||
+        localOriginPattern.test(origin) ||
+        allowedOrigins.has(origin) ||
+        vercelFrontendPattern.test(origin)
+      ) {
         return callback(null, true);
       }
       return callback(new Error(`CORS blocked for origin: ${origin}`));
@@ -216,8 +227,8 @@ app.get(/^\/api\/github\/(.+)$/, async (req, res) => {
 // ── health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-app.listen(PORT, () => {
-  console.log(`✅ RepoScan proxy server running on http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`✅ RepoScan proxy server running on http://${HOST}:${PORT}`);
   console.log(`   Groq API key:  ${process.env.GROQ_API_KEY ? "✅ loaded" : "❌ missing"}`);
   console.log(`   GitHub token:  ${process.env.GITHUB_TOKEN ? "✅ loaded" : "⚠️  not set (rate limits apply)"}`);
 });

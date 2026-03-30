@@ -11,15 +11,33 @@ const app = express();
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 
-app.use(cors({
-  origin: [
-    "http://localhost:5173",
-    "http://localhost:8080",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:8080",
-    "https://e3f8-2409-40e5-1059-6da9-94c8-55e4-504c-5c6d.ngrok-free.app",
-  ],
-}));
+const defaultAllowedOrigins = [
+  "http://localhost:5173",
+  "http://localhost:8080",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:8080",
+  "https://e3f8-2409-40e5-1059-6da9-94c8-55e4-504c-5c6d.ngrok-free.app",
+];
+const configuredOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+const allowedOrigins = new Set([...defaultAllowedOrigins, ...configuredOrigins]);
+const vercelFrontendPattern = /^https:\/\/mergex-frontend(?:-[a-z0-9-]+)?\.vercel\.app$/i;
+
+const isAllowedOrigin = (origin) =>
+  !origin || allowedOrigins.has(origin) || vercelFrontendPattern.test(origin);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedOrigin(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+  })
+);
 app.use(express.json());
 
 const toBase64Url = (value) =>
@@ -836,7 +854,7 @@ app.get("/api/github/pr-status", async (req, res) => {
 registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey, createGithubAppJwt });
 
 const PORT = Number(process.env.PORT || 3001);
-const HOST = process.env.HOST || "127.0.0.1";
+const HOST = process.env.HOST || "0.0.0.0";
 
 const server = app.listen(PORT, HOST, () => {
   console.log(`✅ Backend running on http://${HOST}:${PORT}`);
