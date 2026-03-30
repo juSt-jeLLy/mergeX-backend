@@ -559,53 +559,101 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
      *         PR_SUBMITTED (org never reviewed) — org's fault:
      *           100% of stake returned to contributor
      */
+    // function claimExpiredBounty(uint256 _bountyId)
+    //     external
+    //     nonReentrant
+    //     bountyExists(_bountyId)
+    // {
+    //     Bounty storage b = bounties[_bountyId];
+    //     require(b.assignedTo == msg.sender, "Not assigned to you");
+    //     require(
+    //         b.status == BountyStatus.ASSIGNED || b.status == BountyStatus.PR_SUBMITTED,
+    //         "Not in an expirable state"
+    //     );
+    //     require(block.timestamp > b.deadline, "Deadline not passed");
+
+    //     BountyStatus prevStatus = b.status;
+    //     uint256 stake = b.contributorStake;
+
+    //     // Reset bounty to OPEN
+    //     b.status           = BountyStatus.OPEN;
+    //     b.assignedTo       = address(0);
+    //     b.deadline         = 0;
+    //     b.contributorStake = 0;
+    //     b.prUrl            = "";
+    //     b.prSubmittedAt    = 0;
+
+    //     repos[b.repoId].available += b.amount;
+    //     contributorStakes[msg.sender] -= stake;
+    //     _removeBountyFromContributor(msg.sender, _bountyId);
+
+    //     uint256 stakeReturned;
+    //     uint256 slashedAmount;
+
+    //     if (prevStatus == BountyStatus.ASSIGNED) {
+    //         // Abandoned — never submitted a PR — slash 50%
+    //         slashedAmount  = (stake * ABANDON_SLASH_BPS) / 10000;
+    //         stakeReturned  = stake - slashedAmount;
+    //         // Slashed portion goes back into the repo's reward pool
+    //         repos[b.repoId].available += slashedAmount;
+    //     } else {
+    //         // PR was submitted but org didn't respond — full return
+    //         stakeReturned = stake;
+    //         slashedAmount = 0;
+    //     }
+
+    //     payable(msg.sender).transfer(stakeReturned);
+
+    //     emit BountyExpired(_bountyId, msg.sender, prevStatus, stakeReturned, slashedAmount);
+    // }
+
     function claimExpiredBounty(uint256 _bountyId)
-        external
-        nonReentrant
-        bountyExists(_bountyId)
-    {
-        Bounty storage b = bounties[_bountyId];
-        require(b.assignedTo == msg.sender, "Not assigned to you");
-        require(
-            b.status == BountyStatus.ASSIGNED || b.status == BountyStatus.PR_SUBMITTED,
-            "Not in an expirable state"
-        );
-        require(block.timestamp > b.deadline, "Deadline not passed");
+    external
+    nonReentrant
+    bountyExists(_bountyId)
+{
+    Bounty storage b = bounties[_bountyId];
+    require(b.assignedTo != address(0), "No one assigned");
+    require(
+        b.status == BountyStatus.ASSIGNED || b.status == BountyStatus.PR_SUBMITTED,
+        "Not in an expirable state"
+    );
+    require(block.timestamp > b.deadline, "Deadline not passed");
 
-        BountyStatus prevStatus = b.status;
-        uint256 stake = b.contributorStake;
+    BountyStatus prevStatus = b.status;
+    address contributor = b.assignedTo;  // ← capture before reset
+    uint256 stake = b.contributorStake;
 
-        // Reset bounty to OPEN
-        b.status           = BountyStatus.OPEN;
-        b.assignedTo       = address(0);
-        b.deadline         = 0;
-        b.contributorStake = 0;
-        b.prUrl            = "";
-        b.prSubmittedAt    = 0;
+    // Reset bounty to OPEN
+    b.status           = BountyStatus.OPEN;
+    b.assignedTo       = address(0);
+    b.deadline         = 0;
+    b.contributorStake = 0;
+    b.prUrl            = "";
+    b.prSubmittedAt    = 0;
 
-        repos[b.repoId].available += b.amount;
-        contributorStakes[msg.sender] -= stake;
-        _removeBountyFromContributor(msg.sender, _bountyId);
+    repos[b.repoId].available += b.amount;
+    contributorStakes[contributor] -= stake;
+    _removeBountyFromContributor(contributor, _bountyId);
 
-        uint256 stakeReturned;
-        uint256 slashedAmount;
+    uint256 stakeReturned;
+    uint256 slashedAmount;
 
-        if (prevStatus == BountyStatus.ASSIGNED) {
-            // Abandoned — never submitted a PR — slash 50%
-            slashedAmount  = (stake * ABANDON_SLASH_BPS) / 10000;
-            stakeReturned  = stake - slashedAmount;
-            // Slashed portion goes back into the repo's reward pool
-            repos[b.repoId].available += slashedAmount;
-        } else {
-            // PR was submitted but org didn't respond — full return
-            stakeReturned = stake;
-            slashedAmount = 0;
-        }
-
-        payable(msg.sender).transfer(stakeReturned);
-
-        emit BountyExpired(_bountyId, msg.sender, prevStatus, stakeReturned, slashedAmount);
+    if (prevStatus == BountyStatus.ASSIGNED) {
+        slashedAmount = (stake * ABANDON_SLASH_BPS) / 10000;
+        stakeReturned = stake - slashedAmount;
+        repos[b.repoId].available += slashedAmount;
+    } else {
+    // PR_SUBMITTED — org didn't review in time
+    // contributor did everything right → full stake back
+        stakeReturned = stake;
+        slashedAmount = 0;
     }
+
+    payable(contributor).transfer(stakeReturned);  // ← contributor, not msg.sender
+
+    emit BountyExpired(_bountyId, contributor, prevStatus, stakeReturned, slashedAmount);
+}
 
     /**
      * @notice Safety valve: withdraw stake that is no longer locked in any bounty.
